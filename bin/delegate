@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+# delegate — assign a scoped task to a Claude Code agent in its own isolated
+# herdr workspace + git worktree. One repo per workspace.
+#
+# Wraps three herdr calls that are otherwise retyped per repo:
+#   herdr worktree create   (git worktree add + a NEW workspace, in one step)
+#   herdr agent start        (launch Claude Code in that workspace's pane)
+#   herdr agent prompt       (send the scoped task, optionally block until idle)
+set -euo pipefail
+
+HERDR="${HERDR_BIN:-herdr}"
+SCRATCH_ROOT="${AGENT_SCRATCHPAD:-$HOME/.agent_scratchpad}"
+
+usage() {
+  cat <<'EOF'
+Usage: delegate <repo_path> <branch> <prompt> [options]
+
+  <repo_path>   Path to the source git repo (its worktree list is the source checkout)
+  <branch>      New feature branch for the isolated worktree
+  <prompt>      Task text sent to the sub-agent (scoped to THIS repo only)
+
+Options:
+  --base <ref>      Base ref for the new branch (default: current HEAD of repo)
+  --session <id>    Shared scratchpad session id (default: $USER-$(date-less counter))
+  --wait            Block until the sub-agent returns to idle before exiting
+  --label <text>    Workspace label (default: <repo-name>/<branch>)
+  --dry-run         Print the herdr commands instead of running them
+  --fresh           Reused worktree: start a new Claude session (skip resume)
+  --fork-session    If the matched session is already running, branch a copy
+                    instead of skipping (default: skip and report)
+  -h, --help
+
+Env: HERDR_BIN (default herdr), AGENT_SCRATCHPAD (default ~/.agent_scratchpad)
+EOF
+}
+
+[[ $# -lt 3 || "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { usage; exit 0; }
+
+repo=$1 branch=$2 prompt=$3; shift 3
+base="" session="" wait=0 label="" dry=0 fresh=0 resume=0 resume_id="" fork=0
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --base) base=$2; shift 2;;
+    --session) session=$2; shift 2;;
+    --wait) wait=1; shift;;
+    --label) label=$2; shift 2;;
+    --dry-run) dry=1; shift;;
+    --fresh) fresh=1; shift;;
+    --fork-session) fork=1; shift;;
+    *) echo "unknown option: $1" >&2; exit 2;;
+  esac
+done
+
+[[ -d "$repo/.git" || -f "$repo/.git" ]] || { echo "not a git repo: $repo" >&2; exit 1; }
+repo=$(cd "$repo" && pwd)
+repo_name=$(basename "$repo")
+[[ -n "$label" ]] || label="$repo_name/$branch"
+# session id has no timestamp source in-script; caller passes one for reuse
+[[ -n "$session" ]] || session="${USER}-${repo_name}-${branch//\//-}"
+scratch="$SCRATCH_ROOT/$session"
+
+run() { if (( dry )); then printf '  %q ' "$@"; echo; else "$@"; fi; }
+
+# Pick the Claude session UUID for THIS work under a project dir. Prefer a session
+# whose recorded gitBranch matches the target branch; else one whose branch/slug/
+# title/last-prompt carries the ticket token. Newest-first, so the freshest wins.
+# Prints the uuid (its .jsonl stem) or nothing.
+pick_session() {
+  local dir=$1 want=$2 ticket=$3 f gb
+  [[ -d "$dir" ]] || return 1
+  while IFS= read -r f; do
+    gb=$(jq -r 'select((.gitBranch // "") != "") | .gitBranch' "$f" 2>/dev/null | head -1)
+    [[ "$gb" == "$want" ]] && { basename "$f" .jsonl; return 0; }
+  done < <(ls -t "$dir"/*.jsonl 2>/dev/null)
+  [[ -n "$ticket" ]] || return 1
+  while IFS= read -r f; do
+    jq -r '[.gitBranch,.slug,.aiTitle,.lastPrompt]|@tsv' "$f" 2>/dev/null \
+      | grep -qiE "$ticket" && { basename "$f" .jsonl; return 0; }
+  done < <(ls -t "$dir"/*.jsonl 2>/dev/null)
+  return 1
+}
+
+# True if a Claude session id is currently active (interactive or background).
+# A live session can't be --resume'd — claude exits telling you to fork or attach.
+session_is_live() {
+  local id=$1
+  [[ -n "$id" ]] || return 1
+  claude agents --json 2>/dev/null \
+    | jq -e --arg id "$id" 'any(.[]?; (.sessionId // .session_id // .id) == $id)' >/dev/null 2>&1
+}
+
+echo "repo=$repo  branch=$branch  base=${base:-HEAD}  session=$session"
+echo "scratchpad=$scratch"
+run mkdir -p "$scratch/contracts" "$scratch/schemas" "$scratch/types"
+# drop the operating rules next to delegate into the session, once
+AGENT_MD="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/AGENT.md"
+[[ -f "$AGENT_MD" && $dry -eq 0 ]] && cp -n "$AGENT_MD" "$scratch/AGENT.md" 2>/dev/null || true
+
+# 1) resolve the worktree: reuse an existing one for this branch, else create a
+#    NEW workspace. worktree list reports every worktree for the repo; a matching
+#    branch means the checkout already exists (create would collide on it).
+# herdr agent names: lowercase [a-z0-9_-], 1-32 chars, start with a letter.
+# Sanitize; if too long, keep a readable head + short deterministic hash so the
+# name stays unique per repo+branch (it's also the key we match to reuse agents).
+agent_name=$(printf 'claude-%s-%s' "$repo_name" "$branch" \
+  | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed 's/-\{2,\}/-/g; s/^-//; s/-$//')
+if (( ${#agent_name} > 32 )); then
+  h=$(printf '%s' "$repo_name/$branch" | shasum | cut -c1-6)
+  agent_name="$(printf '%s' "${agent_name:0:25}" | sed 's/-$//')-$h"
+fi
+[[ $agent_name =~ ^[a-z] ]] || agent_name="c-$agent_name"
+agent_name=${agent_name:0:32}
+existing=$("$HERDR" worktree list --cwd "$repo" --json 2>/dev/null \
+  | jq -c --arg b "$branch" '(.result.worktrees // [])[] | select(.branch==$b)' | head -1)
+
+if (( dry )); then
+  if [[ -n "$existing" ]]; then
+    echo "[dry-run] reuse worktree $(printf '%s' "$existing" | jq -r .path)"
+    echo "[dry-run] $HERDR worktree open --cwd $repo --path <path> --no-focus --json"
+  else
+    echo "[dry-run] $HERDR worktree create --cwd $repo --branch $branch --label $label ${base:+--base $base} --no-focus --json"
+  fi
+  echo "[dry-run] reuse agent $agent_name if running; else --resume the session whose gitBranch matches $branch (skip if that session is already live, unless --fork-session; --fresh forces new)"
+  echo "[dry-run] $HERDR agent prompt <pane> <scoped-prompt> $([[ $wait == 1 ]] && echo '--wait --until idle')"
+  exit 0
+fi
+
+if [[ -n "$existing" ]]; then
+  wt_path=$(printf '%s' "$existing" | jq -r '.path')
+  # sessions for this worktree live under ~/.claude/projects/<cwd, / and . -> ->.
+  # Resume the one that did THIS ticket's work (by gitBranch), not just the latest.
+  if (( ! fresh )); then
+    sess_enc=$(printf '%s' "$wt_path" | sed 's#[/.]#-#g')
+    ticket=$(printf '%s' "$branch" | grep -oE '[A-Za-z]+-[0-9]+' | head -1)
+    resume_id=$(pick_session "$HOME/.claude/projects/$sess_enc" "$branch" "$ticket") && resume=1
+  fi
+  # If that session is already running (bg agent), --resume can't attach — claude
+  # exits. Skip rather than spawn a duplicate agent on the same worktree, unless
+  # --fork-session was asked (branch a copy from its history).
+  if (( resume )) && (( ! fork )) && session_is_live "$resume_id"; then
+    echo "session $resume_id already running for $wt_path — not spawning a duplicate."
+    echo "  attach: claude agents   |   branch a copy: re-run with --fork-session"
+    exit 0
+  fi
+  echo "reusing worktree $wt_path"
+  # open is idempotent — returns the live workspace if already open, else reopens.
+  create_json=$("$HERDR" worktree open --cwd "$repo" --path "$wt_path" --no-focus --json)
+else
+  create_args=(worktree create --cwd "$repo" --branch "$branch" --label "$label" --no-focus --json)
+  [[ -n "$base" ]] && create_args+=(--base "$base")
+  create_json=$("$HERDR" "${create_args[@]}")
+fi
+
+# ponytail: pane-id path mirrors `pane split` (.result.root_pane.pane_id); fall
+# back to the first pane_id anywhere in the payload if herdr nests it elsewhere.
+pane=$(printf '%s' "$create_json" | jq -er '.result.root_pane.pane_id // (.. | .pane_id? // empty)' | head -1)
+ws=$(printf '%s' "$create_json" | jq -er '.result.workspace.workspace_id // .result.workspace_id // (.. | .workspace_id? // empty)' | head -1)
+[[ -n "$pane" ]] || { echo "could not read pane id from worktree resolve:" >&2; echo "$create_json" >&2; exit 1; }
+echo "workspace=$ws  pane=$pane"
+
+# A reopened worktree's pane is lazy — no shell PTY spawns until the workspace is
+# rendered, so a headless agent start hits agent_pane_busy. Kick the pane with a
+# no-op command to boot its shell without stealing UI focus. (Fresh worktree
+# create boots eagerly, so only reused checkouts need this.)
+[[ -n "$existing" ]] && "$HERDR" pane run "$pane" true >/dev/null 2>&1 || true
+
+# 2) launch Claude Code in the root pane — unless the agent for this repo+branch is
+#    already alive (reused worktree). Match by its deterministic NAME across the
+#    session and prompt that pane, so a re-run never hits agent_name_taken. NAME must
+#    be unique or a shared one mislands in a 2nd pane. agent start blocks until ready.
+live_pane=$("$HERDR" agent list 2>/dev/null \
+  | jq -r --arg n "$agent_name" '(.result.agents // [])[] | select((.name // "")==$n) | .pane_id' | head -1)
+if [[ -n "$live_pane" ]]; then
+  echo "reusing running agent $agent_name in $live_pane"
+  pane="$live_pane"
+else
+  start_args=(agent start "$agent_name" --kind claude --pane "$pane" --timeout 120000)
+  # -- passes args to claude; --resume <uuid> reopens the exact session that did
+  # this ticket's work (resolved by gitBranch), restoring its context.
+  (( resume )) && { echo "resuming Claude session $resume_id (branch $branch)"; start_args+=(-- --resume "$resume_id"); (( fork )) && start_args+=(--fork-session); }
+  # The kicked pane's shell boots a beat later; agent start returns agent_pane_busy
+  # until it's up. Wait briefly and retry — do NOT re-kick (that respawns the term).
+  started=0
+  for _ in $(seq 1 10); do
+    if out=$("$HERDR" "${start_args[@]}" 2>&1); then started=1; break; fi
+    printf '%s' "$out" | grep -q agent_pane_busy || { echo "agent start failed: $out" >&2; exit 1; }
+    sleep 1
+  done
+  (( started )) || { echo "agent start: pane $pane never became an available shell" >&2; exit 1; }
+fi
+
+# 3) inject the scoped prompt. A reused/resumed agent already carries the operating
+#    rules from its earlier session, so send only the task; a cold agent gets the
+#    full preamble.
+if [[ -n "$live_pane" ]] || (( resume )); then
+  full_prompt="Continuing on repo '$repo_name' branch '$branch'. Scratchpad: $scratch
+(re-read AGENT.md there if unsure of the rules). Task: $prompt"
+else
+  full_prompt="You are an isolated sub-agent for repo '$repo_name' on branch '$branch'.
+AGENT_SCRATCHPAD_SESSION=$scratch
+Read \$AGENT_SCRATCHPAD_SESSION/AGENT.md first — it holds your operating rules
+(worktree boundaries, cross-repo sync via the scratchpad, status signalling).
+Task: $prompt"
+fi
+
+prompt_args=(agent prompt "$pane" "$full_prompt")
+(( wait )) && prompt_args+=(--wait --until idle)
+"$HERDR" "${prompt_args[@]}"
+echo "delegated to $label (pane $pane)"

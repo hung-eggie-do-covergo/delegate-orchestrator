@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# orchestrate — launch a constrained multi-repo orchestrator for a ticket.
+#
+# Spins up a herdr workspace at the workspace root, starts a Claude agent with
+# file-editing tools DISABLED (so it can only discover + delegate, never touch a
+# repo itself — a capability boundary that survives context drift), and kicks off
+# the delegate-orchestrator skill for the ticket. All repo work is done by the
+# per-repo sub-agents `delegate` spawns, never by this orchestrator.
+set -euo pipefail
+
+HERDR="${HERDR_BIN:-herdr}"
+# tools the orchestrator must never have — it delegates all file changes
+DISALLOWED=(Edit Write NotebookEdit)
+
+usage() {
+  cat <<'EOF'
+Usage: orchestrate <ticket> [options]
+
+  <ticket>        Ticket id to orchestrate (e.g. PROJ-1234)
+
+Options:
+  --cwd <path>    Workspace root the orchestrator scans (default: $PWD)
+  --label <text>  Workspace label (default: "orchestrator <ticket>")
+  --task <text>   Extra task detail appended to the standard prompt
+  --focus         Focus the new workspace (default: leave focus where it is)
+  --dry-run       Print the herdr calls instead of running them
+  -h, --help
+
+Env: HERDR_BIN (default herdr)
+EOF
+}
+
+[[ $# -lt 1 || "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { usage; exit 0; }
+
+ticket=$1; shift
+cwd="$PWD" label="" task="" focus="--no-focus" dry=0
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --cwd) cwd=$2; shift 2;;
+    --label) label=$2; shift 2;;
+    --task) task=$2; shift 2;;
+    --focus) focus="--focus"; shift;;
+    --dry-run) dry=1; shift;;
+    *) echo "unknown option: $1" >&2; exit 2;;
+  esac
+done
+
+[[ -d "$cwd" ]] || { echo "not a directory: $cwd" >&2; exit 1; }
+cwd=$(cd "$cwd" && pwd)
+[[ -n "$label" ]] || label="orchestrator $ticket"
+
+# herdr agent names: lowercase [a-z0-9_-], start with a letter, <=32 chars.
+name=$(printf 'orchestrator-%s' "$ticket" \
+  | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed 's/-\{2,\}/-/g; s/^-//; s/-$//')
+name=${name:0:32}
+
+read -r -d '' prompt <<EOF || true
+Invoke the delegate-orchestrator skill for ticket $ticket. Your cwd ($cwd) is the workspace root to scan.
+
+You are the ORCHESTRATOR. Your file-editing tools are disabled on purpose: you never edit repos, run builds/tests/migrations, or commit. You only discover (read-only scan), ask me which worktrees to reopen, call the \`delegate\` CLI to hand each repo's work to its own sub-agent, and report what delegate outputs. Every change to every repo is done by that repo's delegated sub-agent.${task:+
+
+$task}
+EOF
+
+if (( dry )); then
+  echo "[dry-run] $HERDR workspace create --cwd $cwd --label '$label' $focus"
+  echo "[dry-run] $HERDR agent start $name --kind claude --pane <root> --timeout 120000 -- --disallowedTools ${DISALLOWED[*]}"
+  echo "[dry-run] $HERDR agent prompt <root> <orchestrator-prompt>"
+  exit 0
+fi
+
+create_json=$("$HERDR" workspace create --cwd "$cwd" --label "$label" $focus)
+pane=$(printf '%s' "$create_json" | jq -er '.result.root_pane.pane_id // (.. | .pane_id? // empty)' | head -1)
+ws=$(printf '%s' "$create_json" | jq -er '.result.workspace.workspace_id // (.. | .workspace_id? // empty)' | head -1)
+[[ -n "$pane" ]] || { echo "could not read pane id from workspace create:" >&2; echo "$create_json" >&2; exit 1; }
+echo "orchestrator workspace=$ws  pane=$pane  (edit tools disabled: ${DISALLOWED[*]})"
+
+# A freshly created pane's shell boots a beat later; agent start returns
+# agent_pane_busy until it's up. Wait briefly and retry.
+started=0
+for _ in $(seq 1 10); do
+  if out=$("$HERDR" agent start "$name" --kind claude --pane "$pane" --timeout 120000 \
+             -- --disallowedTools "${DISALLOWED[@]}" 2>&1); then started=1; break; fi
+  printf '%s' "$out" | grep -q agent_pane_busy || { echo "agent start failed: $out" >&2; exit 1; }
+  sleep 1
+done
+(( started )) || { echo "agent start: pane $pane never became an available shell" >&2; exit 1; }
+"$HERDR" agent prompt "$pane" "$prompt" >/dev/null
+echo "launched orchestrator $name for $ticket in pane $pane"
+echo "watch/answer: herdr workspace focus $ws"
