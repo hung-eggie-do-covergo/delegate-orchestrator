@@ -84,6 +84,11 @@ delegate <repo_path> <branch> "<scoped prompt>" --session <shared-id> [--wait]
   to read the exact shape from there and NOT invent it.
 - `delegate --dry-run …` prints the herdr calls without mutating anything — use it to
   preview before a real fan-out.
+- **Model per repo** — `delegate … --model <opus|sonnet|haiku>` picks the sub-agent's
+  model. Default the real code work to `opus`; downgrade a small/mechanical repo (rename,
+  config bump, doc edit) to `sonnet` or `haiku` to save tokens; upgrade only when genuinely
+  hard. `orchestrate --delegate-model` sets your default; state the model you chose per repo
+  when you report. Your own orchestrator model stays cheap (you never edit).
 
 **Fan out independent repos concurrently.** Each `delegate` is one repo (own git, own
 workspace), so calls to *different* repos never race — run them in parallel and wall-clock

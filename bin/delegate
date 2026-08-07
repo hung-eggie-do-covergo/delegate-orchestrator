@@ -28,6 +28,8 @@ Options:
   --fresh           Reused worktree: start a new Claude session (skip resume)
   --fork-session    If the matched session is already running, branch a copy
                     instead of skipping (default: skip and report)
+  --model <name>    Model for this sub-agent's Claude (e.g. opus, sonnet, haiku).
+                    Default: inherit the session default. Env: DELEGATE_MODEL.
   -h, --help
 
 Env: HERDR_BIN (default herdr), AGENT_SCRATCHPAD (default ~/.agent_scratchpad)
@@ -38,6 +40,7 @@ EOF
 
 repo=$1 branch=$2 prompt=$3; shift 3
 base="" session="" wait=0 label="" dry=0 fresh=0 resume=0 resume_id="" fork=0
+model="${DELEGATE_MODEL:-}"
 while [[ $# -gt 0 ]]; do
   case $1 in
     --base) base=$2; shift 2;;
@@ -47,6 +50,7 @@ while [[ $# -gt 0 ]]; do
     --dry-run) dry=1; shift;;
     --fresh) fresh=1; shift;;
     --fork-session) fork=1; shift;;
+    --model) model=$2; shift 2;;
     *) echo "unknown option: $1" >&2; exit 2;;
   esac
 done
@@ -120,7 +124,7 @@ if (( dry )); then
   else
     echo "[dry-run] $HERDR worktree create --cwd $repo --branch $branch --label $label ${base:+--base $base} --no-focus --json"
   fi
-  echo "[dry-run] reuse agent $agent_name if running; else --resume the session whose gitBranch matches $branch (skip if that session is already live, unless --fork-session; --fresh forces new)"
+  echo "[dry-run] reuse agent $agent_name if running; else --resume the session whose gitBranch matches $branch (skip if that session is already live, unless --fork-session; --fresh forces new)${model:+; model=$model}"
   echo "[dry-run] $HERDR agent prompt <pane> <scoped-prompt> $([[ $wait == 1 ]] && echo '--wait --until idle')"
   exit 0
 fi
@@ -175,9 +179,12 @@ if [[ -n "$live_pane" ]]; then
   pane="$live_pane"
 else
   start_args=(agent start "$agent_name" --kind claude --pane "$pane" --timeout 120000)
-  # -- passes args to claude; --resume <uuid> reopens the exact session that did
-  # this ticket's work (resolved by gitBranch), restoring its context.
-  (( resume )) && { echo "resuming Claude session $resume_id (branch $branch)"; start_args+=(-- --resume "$resume_id"); (( fork )) && start_args+=(--fork-session); }
+  # args after -- go to claude: --model picks the sub-agent's model; --resume
+  # <uuid> reopens the exact session that did this ticket's work (by gitBranch).
+  claude_args=()
+  [[ -n "$model" ]] && { echo "model=$model"; claude_args+=(--model "$model"); }
+  (( resume )) && { echo "resuming Claude session $resume_id (branch $branch)"; claude_args+=(--resume "$resume_id"); (( fork )) && claude_args+=(--fork-session); }
+  (( ${#claude_args[@]} )) && start_args+=(-- "${claude_args[@]}")
   # The kicked pane's shell boots a beat later; agent start returns agent_pane_busy
   # until it's up. Wait briefly and retry — do NOT re-kick (that respawns the term).
   started=0

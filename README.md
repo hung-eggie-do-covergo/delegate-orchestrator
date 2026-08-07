@@ -159,6 +159,11 @@ orchestrator  (constrained Claude agent — discovers + delegates, never edits)
 - **Constrained orchestrator** — launched with `Edit`/`Write`/`NotebookEdit`
   disabled, so "only delegate, never edit" is a capability boundary, not a
   fragile instruction.
+- **Model per role** — the orchestrator only coordinates, so it runs on a cheap
+  model (`orchestrate --model`, default `sonnet`); each delegate does the real
+  code work on a stronger one (`--delegate-model`, default `opus`), and the
+  orchestrator downgrades small/mechanical repos to save tokens. Drive it
+  directly with `delegate … --model <name>` (or the `DELEGATE_MODEL` env var).
 
 ## Layout
 
