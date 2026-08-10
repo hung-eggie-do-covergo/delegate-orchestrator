@@ -12,6 +12,24 @@ HERDR="${HERDR_BIN:-herdr}"
 # tools the orchestrator must never have — it delegates all file changes
 DISALLOWED=(Edit Write NotebookEdit)
 
+# Submit a prompt and confirm it went in. herdr's --wait returns
+# agent_prompt_stalled if the agent never leaves idle — the Enter keystroke can be
+# eaten by the target's UI redraw, leaving the text unsent. Then send-keys enter
+# (NOT re-prompt, which doubles the text) and re-verify.
+submit_prompt() {
+  local pane=$1 text=$2 out
+  if out=$("$HERDR" agent prompt "$pane" "$text" --wait --until working --timeout 5000 2>&1); then
+    return 0
+  elif printf '%s' "$out" | grep -qE 'agent_prompt_stalled|timeout'; then
+    echo "prompt stalled on $pane — pressing Enter to submit" >&2
+    "$HERDR" agent send-keys "$pane" enter >/dev/null 2>&1 || true
+    "$HERDR" agent wait "$pane" --until working --timeout 5000 >/dev/null 2>&1 \
+      || { echo "prompt on $pane never started the orchestrator after retry" >&2; return 1; }
+  else
+    echo "agent prompt failed: $out" >&2; return 1
+  fi
+}
+
 usage() {
   cat <<'EOF'
 Usage: orchestrate <ticket> [options]
@@ -94,6 +112,6 @@ for _ in $(seq 1 10); do
   sleep 1
 done
 (( started )) || { echo "agent start: pane $pane never became an available shell" >&2; exit 1; }
-"$HERDR" agent prompt "$pane" "$prompt" >/dev/null
+submit_prompt "$pane" "$prompt" || exit 1
 echo "launched orchestrator $name for $ticket in pane $pane"
 echo "watch/answer: herdr workspace focus $ws"

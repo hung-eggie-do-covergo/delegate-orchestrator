@@ -115,6 +115,11 @@ missed. If one was, delegate it too. Silent partial coverage is the main failure
 - `herdr workspace list` — the per-repo workspaces you created.
 - `herdr agent attach <pane>` — jump into a sub-agent live.
 - `herdr agent wait <pane> --until idle` — block on one manually.
+- **Prompting a sub-agent directly** (a follow-up/steer, not via `delegate`): always
+  send with `herdr agent prompt <pane> <text> --wait --until working --timeout 5000`. If it
+  returns `agent_prompt_stalled`, the text landed but Enter didn't register — recover with
+  `herdr agent send-keys <pane> enter`, then re-check. `delegate`'s initial prompt already
+  does this; a bare `agent prompt` can silently leave the text unsent in the input box.
 
 ## Teardown (per repo, when merged/abandoned)
 To review which sub-agents have finished and tear them down safely (with confirmation),

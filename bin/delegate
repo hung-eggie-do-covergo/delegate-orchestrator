@@ -84,6 +84,28 @@ pick_session() {
   return 1
 }
 
+# Submit a prompt and confirm it actually went in. herdr's --wait returns
+# agent_prompt_stalled when the agent never leaves idle in the window — the Enter
+# keystroke can be eaten by the target's UI redraw, leaving the text unsent in the
+# input box. On a stall the text is already there, so press Enter via send-keys
+# (NOT re-prompt, which doubles the text) and re-verify. arg3=1 also waits to idle.
+# ponytail: a task finishing inside the 5s window can miss the transient 'working'
+# and false-stall; negligible for minutes-long code work, extra Enter is a no-op.
+submit_prompt() {
+  local pane=$1 text=$2 until_idle=$3 out
+  if out=$("$HERDR" agent prompt "$pane" "$text" --wait --until working --timeout 5000 2>&1); then
+    :
+  elif printf '%s' "$out" | grep -qE 'agent_prompt_stalled|timeout'; then
+    echo "prompt stalled on $pane — text landed but Enter didn't register; pressing Enter" >&2
+    "$HERDR" agent send-keys "$pane" enter >/dev/null 2>&1 || true
+    "$HERDR" agent wait "$pane" --until working --timeout 5000 >/dev/null 2>&1 \
+      || { echo "prompt on $pane never started the agent after retry" >&2; return 1; }
+  else
+    echo "agent prompt failed: $out" >&2; return 1
+  fi
+  (( until_idle )) && "$HERDR" agent wait "$pane" --until idle >/dev/null
+}
+
 # True if a Claude session id is currently active (interactive or background).
 # A live session can't be --resume'd — claude exits telling you to fork or attach.
 session_is_live() {
@@ -125,7 +147,7 @@ if (( dry )); then
     echo "[dry-run] $HERDR worktree create --cwd $repo --branch $branch --label $label ${base:+--base $base} --no-focus --json"
   fi
   echo "[dry-run] reuse agent $agent_name if running; else --resume the session whose gitBranch matches $branch (skip if that session is already live, unless --fork-session; --fresh forces new)${model:+; model=$model}"
-  echo "[dry-run] $HERDR agent prompt <pane> <scoped-prompt> $([[ $wait == 1 ]] && echo '--wait --until idle')"
+  echo "[dry-run] $HERDR agent prompt <pane> <scoped-prompt> --wait --until working (verify submit; send-keys enter on stall)$([[ $wait == 1 ]] && echo '; then wait --until idle')"
   exit 0
 fi
 
@@ -210,7 +232,5 @@ Read \$AGENT_SCRATCHPAD_SESSION/AGENT.md first — it holds your operating rules
 Task: $prompt"
 fi
 
-prompt_args=(agent prompt "$pane" "$full_prompt")
-(( wait )) && prompt_args+=(--wait --until idle)
-"$HERDR" "${prompt_args[@]}"
+submit_prompt "$pane" "$full_prompt" "$wait" || exit 1
 echo "delegated to $label (pane $pane)"
