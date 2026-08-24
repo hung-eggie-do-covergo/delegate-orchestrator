@@ -38,7 +38,10 @@ Usage: orchestrate <ticket> [options]
 
 Options:
   --cwd <path>          Workspace root the orchestrator scans (default: $PWD)
-  --label <text>        Workspace label (default: "orchestrator <ticket>")
+  --group <label>       Shared workspace that holds all orchestrators as tabs
+                        (default: "orchestrators"). Reused across runs so the
+                        sidebar shows one collapsible entry, not a flat pile.
+  --label <text>        Tab label for this orchestrator (default: <ticket>)
   --task <text>         Extra task detail appended to the standard prompt
   --model <name>        Orchestrator's model (default: sonnet — it only
                         coordinates, never edits, so a cheap model fits).
@@ -55,10 +58,11 @@ EOF
 [[ $# -lt 1 || "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { usage; exit 0; }
 
 ticket=$1; shift
-cwd="$PWD" label="" task="" focus="--no-focus" dry=0 model="sonnet" delegate_model="opus"
+cwd="$PWD" label="" task="" focus="--no-focus" dry=0 model="sonnet" delegate_model="opus" group="orchestrators"
 while [[ $# -gt 0 ]]; do
   case $1 in
     --cwd) cwd=$2; shift 2;;
+    --group) group=$2; shift 2;;
     --label) label=$2; shift 2;;
     --task) task=$2; shift 2;;
     --model) model=$2; shift 2;;
@@ -71,7 +75,7 @@ done
 
 [[ -d "$cwd" ]] || { echo "not a directory: $cwd" >&2; exit 1; }
 cwd=$(cd "$cwd" && pwd)
-[[ -n "$label" ]] || label="orchestrator $ticket"
+[[ -n "$label" ]] || label="$ticket"
 
 # herdr agent names: lowercase [a-z0-9_-], start with a letter, <=32 chars.
 name=$(printf 'orchestrator-%s' "$ticket" \
@@ -89,18 +93,31 @@ $task}
 EOF
 
 if (( dry )); then
-  echo "[dry-run] $HERDR workspace create --cwd $cwd --label '$label' $focus"
-  echo "[dry-run] $HERDR agent start $name --kind claude --pane <root> --timeout 120000 -- --model $model --disallowedTools ${DISALLOWED[*]}"
+  echo "[dry-run] find-or-create workspace labelled '$group'; add a tab labelled '$label' (its root tab on first run) $focus"
+  echo "[dry-run] $HERDR agent start $name --kind claude --pane <tab-pane> --timeout 120000 -- --model $model --disallowedTools ${DISALLOWED[*]}"
   echo "[dry-run] orchestrator model=$model  delegate default model=$delegate_model"
-  echo "[dry-run] $HERDR agent prompt <root> <orchestrator-prompt>"
+  echo "[dry-run] $HERDR agent prompt <tab-pane> <orchestrator-prompt>"
   exit 0
 fi
 
-create_json=$("$HERDR" workspace create --cwd "$cwd" --label "$label" $focus)
-pane=$(printf '%s' "$create_json" | jq -er '.result.root_pane.pane_id // (.. | .pane_id? // empty)' | head -1)
-ws=$(printf '%s' "$create_json" | jq -er '.result.workspace.workspace_id // (.. | .workspace_id? // empty)' | head -1)
-[[ -n "$pane" ]] || { echo "could not read pane id from workspace create:" >&2; echo "$create_json" >&2; exit 1; }
-echo "orchestrator workspace=$ws  pane=$pane  model=$model  (edit tools disabled: ${DISALLOWED[*]}; delegate default model=$delegate_model)"
+# All orchestrators live as TABS in one shared workspace so the sidebar shows a
+# single collapsible entry, not a flat workspace per ticket (herdr only auto-nests
+# git worktrees; standalone workspaces can't be grouped). Find that workspace, or
+# create it once and reuse its root tab for this first orchestrator.
+ws=$("$HERDR" workspace list 2>/dev/null \
+  | jq -r --arg l "$group" '.result.workspaces[]? | select((.label//"")==$l) | .workspace_id' | head -1)
+if [[ -z "$ws" ]]; then
+  create_json=$("$HERDR" workspace create --cwd "$cwd" --label "$group" $focus)
+  ws=$(printf '%s' "$create_json" | jq -er '.result.workspace.workspace_id')
+else
+  create_json=$("$HERDR" tab create --workspace "$ws" --cwd "$cwd" --label "$label" $focus)
+fi
+pane=$(printf '%s' "$create_json" | jq -er '.result.root_pane.pane_id' | head -1)
+tab=$(printf '%s' "$create_json" | jq -r '.result.tab.tab_id // .result.root_pane.tab_id // empty' | head -1)
+[[ -n "$pane" ]] || { echo "could not read pane id:" >&2; echo "$create_json" >&2; exit 1; }
+# label the tab with the ticket (the fresh workspace's root tab carries the group name)
+[[ -n "$tab" ]] && "$HERDR" tab rename "$tab" "$label" >/dev/null 2>&1 || true
+echo "orchestrator group='$group' workspace=$ws  tab=$tab  pane=$pane  model=$model  (edit tools disabled: ${DISALLOWED[*]}; delegate default model=$delegate_model)"
 
 # A freshly created pane's shell boots a beat later; agent start returns
 # agent_pane_busy until it's up. Wait briefly and retry.
@@ -114,4 +131,4 @@ done
 (( started )) || { echo "agent start: pane $pane never became an available shell" >&2; exit 1; }
 submit_prompt "$pane" "$prompt" || exit 1
 echo "launched orchestrator $name for $ticket in pane $pane"
-echo "watch/answer: herdr workspace focus $ws"
+echo "watch/answer: herdr tab focus ${tab:-$pane}   (or: herdr workspace focus $ws)"

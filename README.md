@@ -54,7 +54,7 @@ From your workspace root (the directory holding your repos):
 orchestrate PROJ-1234
 ```
 
-This creates a herdr workspace, starts a **constrained** orchestrator agent
+This adds a tab in a shared `orchestrators` workspace (created once, so orchestrators group under one collapsible sidebar entry instead of a flat pile), starts a **constrained** orchestrator agent
 (file-editing tools disabled — it can only discover and delegate, never edit a
 repo itself), and invokes the orchestration skill for the ticket. The
 orchestrator scans your repos for the ticket, asks which worktrees to reopen,
