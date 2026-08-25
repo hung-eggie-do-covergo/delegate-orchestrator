@@ -47,7 +47,7 @@ Options:
                         sidebar shows one collapsible entry, not a flat pile.
   --label <text>        Tab label for this orchestrator (default: <ticket>)
   --task <text>         Extra task detail appended to the standard prompt
-  --kind <agent>        Agent runtime: claude (default) or hermes. Used for the
+  --kind <agent>        Agent runtime: hermes (default) or claude. Used for the
                         orchestrator and passed to each delegate.
   --model <name>        Orchestrator's model (default: sonnet — it only
                         coordinates, never edits, so a cheap model fits).
@@ -64,7 +64,7 @@ EOF
 [[ $# -lt 1 || "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { usage; exit 0; }
 
 ticket=$1; shift
-cwd="$PWD" label="" task="" focus="--no-focus" dry=0 model="" delegate_model="" group="orchestrators" kind="claude"
+cwd="$PWD" label="" task="" focus="--no-focus" dry=0 model="" delegate_model="" group="orchestrators" kind="hermes"
 while [[ $# -gt 0 ]]; do
   case $1 in
     --cwd) cwd=$2; shift 2;;

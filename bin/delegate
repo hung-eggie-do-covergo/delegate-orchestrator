@@ -30,7 +30,7 @@ Options:
                     instead of skipping (default: skip and report)
   --model <name>    Model for this sub-agent (e.g. opus/sonnet for claude; a
                     hermes model id for hermes). Default: inherit. Env: DELEGATE_MODEL.
-  --kind <agent>    Agent runtime: claude (default) or hermes.
+  --kind <agent>    Agent runtime: hermes (default) or claude.
   --no-yolo         hermes only: don't pass --yolo (keep approval prompts on).
   -h, --help
 
@@ -41,7 +41,7 @@ EOF
 [[ $# -lt 3 || "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { usage; exit 0; }
 
 repo=$1 branch=$2 prompt=$3; shift 3
-base="" session="" wait=0 label="" dry=0 fresh=0 resume=0 resume_id="" fork=0 kind="claude" yolo=1
+base="" session="" wait=0 label="" dry=0 fresh=0 resume=0 resume_id="" fork=0 kind="hermes" yolo=1
 model="${DELEGATE_MODEL:-}"
 while [[ $# -gt 0 ]]; do
   case $1 in

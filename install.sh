@@ -6,9 +6,12 @@ here=$(cd "$(dirname "$0")" && pwd)
 skills_dst="$HOME/.claude/skills"
 bin_dst="$HOME/.local/bin"
 
-for dep in herdr jq claude; do
+for dep in herdr jq; do
   command -v "$dep" >/dev/null || { echo "missing dep on PATH: $dep" >&2; exit 1; }
 done
+# need at least one agent runtime; hermes is the default kind, claude is --kind claude
+command -v hermes >/dev/null || command -v claude >/dev/null \
+  || { echo "missing agent runtime on PATH: install 'hermes' (default) or 'claude'" >&2; exit 1; }
 
 mkdir -p "$skills_dst/delegate-orchestrator" "$skills_dst/delegate-cleanup" "$bin_dst"
 install -m644 "$here/skills/delegate-orchestrator/SKILL.md" "$skills_dst/delegate-orchestrator/SKILL.md"

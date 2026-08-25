@@ -21,8 +21,8 @@ isolated, and navigable.
 ## Requirements
 
 `herdr`, `jq`, and your agent runtime on `PATH`, run inside a herdr session. The
-runtime is **Claude Code** (`claude`) by default, or **Hermes** (`hermes`) — pass
-`--kind hermes` (see [Runtime](#runtime-claude-or-hermes)).
+runtime is **Hermes** (`hermes`) by default, or **Claude Code** (`claude`) — pass
+`--kind claude` (see [Runtime](#runtime-claude-or-hermes)).
 
 ## Install
 
@@ -32,7 +32,7 @@ cd delegate-orchestrator
 ./install.sh
 ```
 
-`install.sh` verifies `herdr`, `jq`, and `claude` are on `PATH`, then copies:
+`install.sh` verifies `herdr`, `jq`, and an agent runtime (`hermes` or `claude`) are on `PATH`, then copies:
 
 | From | To |
 |---|---|
@@ -170,14 +170,15 @@ orchestrator  (constrained Claude agent — discovers + delegates, never edits)
 
 ## Runtime: Claude or Hermes
 
-Both `orchestrate` and `delegate` take `--kind claude` (default) or `--kind
-hermes`. `orchestrate --kind hermes` runs the orchestrator on Hermes and tells it
+Both `orchestrate` and `delegate` take `--kind hermes` (default) or `--kind
+claude`. `orchestrate` runs the orchestrator on Hermes and tells it
 to delegate every repo with `--kind hermes` too, so the whole fan-out stays on one
 runtime.
 
 ```sh
-orchestrate PROJ-1234 --kind hermes            # whole orchestration on Hermes
-delegate ~/src/api PROJ-1234 "…" --kind hermes # one repo on Hermes
+orchestrate PROJ-1234                            # whole orchestration on Hermes (default)
+orchestrate PROJ-1234 --kind claude            # ... on Claude Code instead
+delegate ~/src/api PROJ-1234 "…" --kind claude # one repo on Claude Code
 ```
 
 What changes per runtime:
