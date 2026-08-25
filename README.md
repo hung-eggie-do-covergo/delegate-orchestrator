@@ -20,7 +20,9 @@ isolated, and navigable.
 
 ## Requirements
 
-`herdr`, `jq`, and `claude` on `PATH`, run inside a herdr session.
+`herdr`, `jq`, and your agent runtime on `PATH`, run inside a herdr session. The
+runtime is **Claude Code** (`claude`) by default, or **Hermes** (`hermes`) — pass
+`--kind hermes` (see [Runtime](#runtime-claude-or-hermes)).
 
 ## Install
 
@@ -156,14 +158,40 @@ orchestrator  (constrained Claude agent — discovers + delegates, never edits)
 - **No duplicate on a live session** — if the matching session is already
   running, delegate reports it instead of spawning a conflicting copy
   (`--fork-session` to branch one deliberately).
-- **Constrained orchestrator** — launched with `Edit`/`Write`/`NotebookEdit`
-  disabled, so "only delegate, never edit" is a capability boundary, not a
-  fragile instruction.
+- **Constrained orchestrator** — the orchestrator is launched without file-editing
+  capability (Claude: `Edit`/`Write`/`NotebookEdit` disabled; Hermes: a toolset
+  allowlist with no `file`/`code_execution`), so "only delegate, never edit" is a
+  capability boundary, not a fragile instruction.
 - **Model per role** — the orchestrator only coordinates, so it runs on a cheap
   model (`orchestrate --model`, default `sonnet`); each delegate does the real
   code work on a stronger one (`--delegate-model`, default `opus`), and the
   orchestrator downgrades small/mechanical repos to save tokens. Drive it
   directly with `delegate … --model <name>` (or the `DELEGATE_MODEL` env var).
+
+## Runtime: Claude or Hermes
+
+Both `orchestrate` and `delegate` take `--kind claude` (default) or `--kind
+hermes`. `orchestrate --kind hermes` runs the orchestrator on Hermes and tells it
+to delegate every repo with `--kind hermes` too, so the whole fan-out stays on one
+runtime.
+
+```sh
+orchestrate PROJ-1234 --kind hermes            # whole orchestration on Hermes
+delegate ~/src/api PROJ-1234 "…" --kind hermes # one repo on Hermes
+```
+
+What changes per runtime:
+
+| | Claude | Hermes |
+|---|---|---|
+| launched as | `claude …` | `hermes --tui …` |
+| model flag | `--model` | `-m` |
+| session resume | exact prior session matched by recorded `gitBranch` | `--resume latest` (the worktree's own cwd scopes its session store) |
+| worker autonomy | pane permission mode | `--yolo` (disable with `delegate --no-yolo`) |
+| orchestrator no-edit | `--disallowedTools Edit Write NotebookEdit` | toolset allowlist without `file`/`code_execution` |
+
+Everything else — herdr worktree reuse, the shared `orchestrators` workspace,
+prompt-submission verification, concurrent fan-out — is identical across runtimes.
 
 ## Layout
 

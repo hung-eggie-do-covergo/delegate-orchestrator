@@ -9,8 +9,12 @@
 set -euo pipefail
 
 HERDR="${HERDR_BIN:-herdr}"
-# tools the orchestrator must never have — it delegates all file changes
+# claude: tools the orchestrator must never have — it delegates all file changes.
 DISALLOWED=(Edit Write NotebookEdit)
+# hermes: toolset allowlist for the orchestrator — everything it needs to discover
+# and delegate (run delegate/herdr/git/rg via terminal, invoke the skill, ask the
+# user) but NO 'file'/'code_execution', so it structurally cannot edit a repo.
+HERMES_ORCH_TOOLSETS="terminal,web,skills,todo,clarify,session_search,memory,delegation"
 
 # Submit a prompt and confirm it went in. herdr's --wait returns
 # agent_prompt_stalled if the agent never leaves idle — the Enter keystroke can be
@@ -43,6 +47,8 @@ Options:
                         sidebar shows one collapsible entry, not a flat pile.
   --label <text>        Tab label for this orchestrator (default: <ticket>)
   --task <text>         Extra task detail appended to the standard prompt
+  --kind <agent>        Agent runtime: claude (default) or hermes. Used for the
+                        orchestrator and passed to each delegate.
   --model <name>        Orchestrator's model (default: sonnet — it only
                         coordinates, never edits, so a cheap model fits).
   --delegate-model <n>  Default model the orchestrator hands each delegate
@@ -58,7 +64,7 @@ EOF
 [[ $# -lt 1 || "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { usage; exit 0; }
 
 ticket=$1; shift
-cwd="$PWD" label="" task="" focus="--no-focus" dry=0 model="sonnet" delegate_model="opus" group="orchestrators"
+cwd="$PWD" label="" task="" focus="--no-focus" dry=0 model="" delegate_model="" group="orchestrators" kind="claude"
 while [[ $# -gt 0 ]]; do
   case $1 in
     --cwd) cwd=$2; shift 2;;
@@ -67,18 +73,27 @@ while [[ $# -gt 0 ]]; do
     --task) task=$2; shift 2;;
     --model) model=$2; shift 2;;
     --delegate-model) delegate_model=$2; shift 2;;
+    --kind) kind=$2; shift 2;;
     --focus) focus="--focus"; shift;;
     --dry-run) dry=1; shift;;
     *) echo "unknown option: $1" >&2; exit 2;;
   esac
 done
+[[ "$kind" == claude || "$kind" == hermes ]] || { echo "unsupported --kind: $kind (claude|hermes)" >&2; exit 2; }
+# claude defaults: cheap coordinator model + opus for the workers. hermes uses its
+# own configured defaults unless the user passes --model/--delegate-model.
+if [[ "$kind" == claude ]]; then
+  [[ -n "$model" ]] || model="sonnet"
+  [[ -n "$delegate_model" ]] || delegate_model="opus"
+fi
 
 [[ -d "$cwd" ]] || { echo "not a directory: $cwd" >&2; exit 1; }
 cwd=$(cd "$cwd" && pwd)
 [[ -n "$label" ]] || label="$ticket"
 
 # herdr agent names: lowercase [a-z0-9_-], start with a letter, <=32 chars.
-name=$(printf 'orchestrator-%s' "$ticket" \
+# kind-prefixed so a claude and a hermes orchestrator for one ticket don't collide.
+name=$(printf '%s-orch-%s' "$kind" "$ticket" \
   | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed 's/-\{2,\}/-/g; s/^-//; s/-$//')
 name=${name:0:32}
 
@@ -87,15 +102,29 @@ Invoke the delegate-orchestrator skill for ticket $ticket. Your cwd ($cwd) is th
 
 You are the ORCHESTRATOR. Your file-editing tools are disabled on purpose: you never edit repos, run builds/tests/migrations, or commit. You only discover (read-only scan), ask me which worktrees to reopen, call the \`delegate\` CLI to hand each repo's work to its own sub-agent, and report what delegate outputs. Every change to every repo is done by that repo's delegated sub-agent.
 
-Model policy: delegate each repo with \`--model $delegate_model\` by default. Downgrade a repo to a cheaper model (e.g. sonnet, haiku) when its task is small or mechanical; upgrade only if the work is genuinely hard. State the model you chose per repo when you report.${task:+
+Runtime: delegate every repo with \`--kind $kind\` (this whole orchestration runs on $kind).
+
+Model policy: delegate each repo with ${delegate_model:+\`--model $delegate_model\` by default}${delegate_model:-the default model}. Downgrade a repo to a cheaper model when its task is small or mechanical; upgrade only if the work is genuinely hard. State the model you chose per repo when you report.${task:+
 
 $task}
 EOF
 
+# orchestrator launch args per runtime — the file-editing capability is removed
+# either way (claude: --disallowedTools; hermes: a toolset allowlist without file).
+if [[ "$kind" == claude ]]; then
+  orch_args=(--model "$model" --disallowedTools "${DISALLOWED[@]}")
+  constraint="edit tools disabled: ${DISALLOWED[*]}"
+else
+  orch_args=(--tui)
+  [[ -n "$model" ]] && orch_args+=(-m "$model")
+  orch_args+=(-t "$HERMES_ORCH_TOOLSETS")
+  constraint="toolsets: $HERMES_ORCH_TOOLSETS (no file/code_execution)"
+fi
+
 if (( dry )); then
   echo "[dry-run] find-or-create workspace labelled '$group'; add a tab labelled '$label' (its root tab on first run) $focus"
-  echo "[dry-run] $HERDR agent start $name --kind claude --pane <tab-pane> --timeout 120000 -- --model $model --disallowedTools ${DISALLOWED[*]}"
-  echo "[dry-run] orchestrator model=$model  delegate default model=$delegate_model"
+  echo "[dry-run] $HERDR agent start $name --kind $kind --pane <tab-pane> --timeout 120000 -- ${orch_args[*]}"
+  echo "[dry-run] orchestrator kind=$kind model=${model:-<default>}  delegate default model=$delegate_model  ($constraint)"
   echo "[dry-run] $HERDR agent prompt <tab-pane> <orchestrator-prompt>"
   exit 0
 fi
@@ -117,14 +146,14 @@ tab=$(printf '%s' "$create_json" | jq -r '.result.tab.tab_id // .result.root_pan
 [[ -n "$pane" ]] || { echo "could not read pane id:" >&2; echo "$create_json" >&2; exit 1; }
 # label the tab with the ticket (the fresh workspace's root tab carries the group name)
 [[ -n "$tab" ]] && "$HERDR" tab rename "$tab" "$label" >/dev/null 2>&1 || true
-echo "orchestrator group='$group' workspace=$ws  tab=$tab  pane=$pane  model=$model  (edit tools disabled: ${DISALLOWED[*]}; delegate default model=$delegate_model)"
+echo "orchestrator kind=$kind group='$group' workspace=$ws  tab=$tab  pane=$pane  model=${model:-<default>}  ($constraint; delegate default model=$delegate_model)"
 
 # A freshly created pane's shell boots a beat later; agent start returns
 # agent_pane_busy until it's up. Wait briefly and retry.
 started=0
 for _ in $(seq 1 10); do
-  if out=$("$HERDR" agent start "$name" --kind claude --pane "$pane" --timeout 120000 \
-             -- --model "$model" --disallowedTools "${DISALLOWED[@]}" 2>&1); then started=1; break; fi
+  if out=$("$HERDR" agent start "$name" --kind "$kind" --pane "$pane" --timeout 120000 \
+             -- "${orch_args[@]}" 2>&1); then started=1; break; fi
   printf '%s' "$out" | grep -q agent_pane_busy || { echo "agent start failed: $out" >&2; exit 1; }
   sleep 1
 done

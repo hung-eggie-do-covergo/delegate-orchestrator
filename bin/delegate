@@ -28,8 +28,10 @@ Options:
   --fresh           Reused worktree: start a new Claude session (skip resume)
   --fork-session    If the matched session is already running, branch a copy
                     instead of skipping (default: skip and report)
-  --model <name>    Model for this sub-agent's Claude (e.g. opus, sonnet, haiku).
-                    Default: inherit the session default. Env: DELEGATE_MODEL.
+  --model <name>    Model for this sub-agent (e.g. opus/sonnet for claude; a
+                    hermes model id for hermes). Default: inherit. Env: DELEGATE_MODEL.
+  --kind <agent>    Agent runtime: claude (default) or hermes.
+  --no-yolo         hermes only: don't pass --yolo (keep approval prompts on).
   -h, --help
 
 Env: HERDR_BIN (default herdr), AGENT_SCRATCHPAD (default ~/.agent_scratchpad)
@@ -39,7 +41,7 @@ EOF
 [[ $# -lt 3 || "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { usage; exit 0; }
 
 repo=$1 branch=$2 prompt=$3; shift 3
-base="" session="" wait=0 label="" dry=0 fresh=0 resume=0 resume_id="" fork=0
+base="" session="" wait=0 label="" dry=0 fresh=0 resume=0 resume_id="" fork=0 kind="claude" yolo=1
 model="${DELEGATE_MODEL:-}"
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -51,9 +53,12 @@ while [[ $# -gt 0 ]]; do
     --fresh) fresh=1; shift;;
     --fork-session) fork=1; shift;;
     --model) model=$2; shift 2;;
+    --kind) kind=$2; shift 2;;
+    --no-yolo) yolo=0; shift;;
     *) echo "unknown option: $1" >&2; exit 2;;
   esac
 done
+[[ "$kind" == claude || "$kind" == hermes ]] || { echo "unsupported --kind: $kind (claude|hermes)" >&2; exit 2; }
 
 [[ -d "$repo/.git" || -f "$repo/.git" ]] || { echo "not a git repo: $repo" >&2; exit 1; }
 repo=$(cd "$repo" && pwd)
@@ -128,7 +133,7 @@ AGENT_MD="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/AGENT.md"
 # herdr agent names: lowercase [a-z0-9_-], 1-32 chars, start with a letter.
 # Sanitize; if too long, keep a readable head + short deterministic hash so the
 # name stays unique per repo+branch (it's also the key we match to reuse agents).
-agent_name=$(printf 'claude-%s-%s' "$repo_name" "$branch" \
+agent_name=$(printf '%s-%s-%s' "$kind" "$repo_name" "$branch" \
   | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed 's/-\{2,\}/-/g; s/^-//; s/-$//')
 if (( ${#agent_name} > 32 )); then
   h=$(printf '%s' "$repo_name/$branch" | shasum | cut -c1-6)
@@ -146,24 +151,34 @@ if (( dry )); then
   else
     echo "[dry-run] $HERDR worktree create --cwd $repo --branch $branch --label $label ${base:+--base $base} --no-focus --json"
   fi
-  echo "[dry-run] reuse agent $agent_name if running; else --resume the session whose gitBranch matches $branch (skip if that session is already live, unless --fork-session; --fresh forces new)${model:+; model=$model}"
+  if [[ "$kind" == claude ]]; then
+    echo "[dry-run] reuse agent $agent_name if running; else --resume the claude session whose gitBranch matches $branch (skip if already live, unless --fork-session; --fresh forces new)${model:+; model=$model}"
+  else
+    echo "[dry-run] reuse agent $agent_name if running; else start hermes --tui$( ((yolo)) && echo ' --yolo')${model:+ -m $model}$( ((! fresh)) && echo ' --resume latest')"
+  fi
   echo "[dry-run] $HERDR agent prompt <pane> <scoped-prompt> --wait --until working (verify submit; send-keys enter on stall)$([[ $wait == 1 ]] && echo '; then wait --until idle')"
   exit 0
 fi
 
 if [[ -n "$existing" ]]; then
   wt_path=$(printf '%s' "$existing" | jq -r '.path')
-  # sessions for this worktree live under ~/.claude/projects/<cwd, / and . -> ->.
-  # Resume the one that did THIS ticket's work (by gitBranch), not just the latest.
+  # Resume prior work in this worktree. claude: pick the session whose gitBranch
+  # matches (its store keys many branches under one project dir). hermes: the
+  # worktree PATH already scopes its SQLite sessions, so `--resume latest` from
+  # this cwd is the right one — no matching needed.
   if (( ! fresh )); then
-    sess_enc=$(printf '%s' "$wt_path" | sed 's#[/.]#-#g')
-    ticket=$(printf '%s' "$branch" | grep -oE '[A-Za-z]+-[0-9]+' | head -1)
-    resume_id=$(pick_session "$HOME/.claude/projects/$sess_enc" "$branch" "$ticket") && resume=1
+    if [[ "$kind" == claude ]]; then
+      sess_enc=$(printf '%s' "$wt_path" | sed 's#[/.]#-#g')
+      ticket=$(printf '%s' "$branch" | grep -oE '[A-Za-z]+-[0-9]+' | head -1)
+      resume_id=$(pick_session "$HOME/.claude/projects/$sess_enc" "$branch" "$ticket") && resume=1
+    else
+      resume=1
+    fi
   fi
-  # If that session is already running (bg agent), --resume can't attach — claude
-  # exits. Skip rather than spawn a duplicate agent on the same worktree, unless
-  # --fork-session was asked (branch a copy from its history).
-  if (( resume )) && (( ! fork )) && session_is_live "$resume_id"; then
+  # claude: if that session is already running (bg agent), --resume can't attach —
+  # skip rather than spawn a duplicate, unless --fork-session. (hermes reuse is
+  # guarded by the herdr agent-name check below, so no separate live check needed.)
+  if [[ "$kind" == claude ]] && (( resume )) && (( ! fork )) && session_is_live "$resume_id"; then
     echo "session $resume_id already running for $wt_path — not spawning a duplicate."
     echo "  attach: claude agents   |   branch a copy: re-run with --fork-session"
     exit 0
@@ -200,13 +215,21 @@ if [[ -n "$live_pane" ]]; then
   echo "reusing running agent $agent_name in $live_pane"
   pane="$live_pane"
 else
-  start_args=(agent start "$agent_name" --kind claude --pane "$pane" --timeout 120000)
-  # args after -- go to claude: --model picks the sub-agent's model; --resume
-  # <uuid> reopens the exact session that did this ticket's work (by gitBranch).
-  claude_args=()
-  [[ -n "$model" ]] && { echo "model=$model"; claude_args+=(--model "$model"); }
-  (( resume )) && { echo "resuming Claude session $resume_id (branch $branch)"; claude_args+=(--resume "$resume_id"); (( fork )) && claude_args+=(--fork-session); }
-  (( ${#claude_args[@]} )) && start_args+=(-- "${claude_args[@]}")
+  start_args=(agent start "$agent_name" --kind "$kind" --pane "$pane" --timeout 120000)
+  # args after -- go to the agent binary. Flags differ per runtime.
+  agent_args=()
+  if [[ "$kind" == claude ]]; then
+    [[ -n "$model" ]] && { echo "model=$model"; agent_args+=(--model "$model"); }
+    (( resume )) && { echo "resuming Claude session $resume_id (branch $branch)"; agent_args+=(--resume "$resume_id"); (( fork )) && agent_args+=(--fork-session); }
+  else
+    # hermes: --tui makes it interactive in the pane (and enables -t); --yolo runs
+    # the isolated worktree autonomously; --resume latest continues this cwd's work.
+    agent_args+=(--tui)
+    [[ -n "$model" ]] && { echo "model=$model"; agent_args+=(-m "$model"); }
+    (( yolo )) && agent_args+=(--yolo)
+    (( resume )) && { echo "resuming latest hermes session in $wt_path"; agent_args+=(--resume latest); }
+  fi
+  (( ${#agent_args[@]} )) && start_args+=(-- "${agent_args[@]}")
   # The kicked pane's shell boots a beat later; agent start returns agent_pane_busy
   # until it's up. Wait briefly and retry — do NOT re-kick (that respawns the term).
   started=0
